@@ -22,15 +22,22 @@ jobs:
           registry-url: 'https://npm.pkg.github.com'
           scope: '@think41'
       
+      - name: Change to client-js-standalone directory
+        working-directory: ./client-js-standalone
+        run: pwd
+      
       - name: Install dependencies
+        working-directory: ./client-js-standalone
         run: npm ci
         env:
           NODE_AUTH_TOKEN: ${{secrets.GITHUB_TOKEN}}
       
       - name: Build package
+        working-directory: ./client-js-standalone
         run: npm run build
       
       - name: Publish to GitHub Packages
+        working-directory: ./client-js-standalone
         run: npm publish
         env:
           NODE_AUTH_TOKEN: ${{secrets.GITHUB_TOKEN}}
