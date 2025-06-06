@@ -11,7 +11,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/think41/client-sdk.git"
+    "url": "git+https://github.com/think41/foundation-voice-client-js.git"
   },
   "scripts": {
     "build": "tsup index.ts --format esm --dts",
