@@ -19,7 +19,9 @@ export async function createRTVIClient(
   let transport;
   switch (transportType) {
     case "websocket":
-      transport = TransportFactory.create("websocket", "ws://localhost:8000/ws");
+      transport = TransportFactory.create("websocket", {
+        url: "http://localhost:8000/ws",
+      });
       break;
     case "webrtc":
       transport = TransportFactory.create("webrtc", {

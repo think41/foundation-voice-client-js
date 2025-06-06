@@ -6,6 +6,7 @@ import {
     Tracks,
 } from "@pipecat-ai/client-js";
 import { WebsocketTransport } from "./websocket";
+import { WebsocketTransportParams } from "./types";
 import { DailyTransport } from "@pipecat-ai/daily-transport";
 import { SmallWebRTCTransport } from "@pipecat-ai/small-webrtc-transport";
 import { GeminiLiveWebsocketTransport, GeminiLLMServiceOptions } from '@pipecat-ai/gemini-live-websocket-transport';
@@ -19,13 +20,12 @@ export type TransportType =
     | "openai";
 
 export interface TransportConfig {
-    websocket: string; 
+    websocket: WebsocketTransportParams; 
     daily: any; 
     webrtc: any; 
     gemini: GeminiLLMServiceOptions;
     openai: OpenAIServiceOptions;
 }
-
 
 export class TransportFactory {
     static create<T extends TransportType>(
@@ -34,7 +34,7 @@ export class TransportFactory {
     ): Transport {
         switch (transportType) {
             case "websocket":
-                return new WebsocketTransport(options as string);
+                return new WebsocketTransport(options as WebsocketTransportParams);
                 
             case "daily":
                 return new DailyTransport(options);

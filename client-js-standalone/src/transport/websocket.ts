@@ -2,11 +2,22 @@ import {
   RTVIClientOptions,
   RTVIMessage,
   RTVIEvent,
+  Transport,
+  TransportState,
+  Tracks
 } from "@pipecat-ai/client-js";
-import { Transport, TransportState, Tracks } from "@pipecat-ai/client-js";
 import * as protobuf from "protobufjs";
+import { AudioProcessor } from '../audio/processor';
+import { EventEmitter } from 'events';
+import { WebsocketTransportParams } from "./types";
 
-// Simplified interfaces for what we expect AFTER protobuf decoding
+// Constants
+const SAMPLE_RATE = 16000;
+const NUM_CHANNELS = 1;
+const MAX_RECONNECT_ATTEMPTS = 5;
+const BASE_RECONNECT_DELAY_MS = 1000;
+
+// Interfaces
 interface DecodedAudioFrame {
   audio: Uint8Array | number[];
   sampleRate: number;
@@ -24,14 +35,8 @@ interface DecodedTranscriptionFrame {
   timestamp?: string;
 }
 
-// Add interruption frame interfaces
-interface DecodedStartInterruptionFrame {
-  // Empty object, used as a signal
-}
-
-interface DecodedStopInterruptionFrame {
-  // Empty object, used as a signal
-}
+interface DecodedStartInterruptionFrame {}
+interface DecodedStopInterruptionFrame {}
 
 interface ParsedPipecatFrame {
   audio?: DecodedAudioFrame;
@@ -46,32 +51,7 @@ interface RTVIMessageData {
   content?: string;
 }
 
-  export interface WebsocketTransportParams {
-  url: string;
-  parameters?: Record<string, string>;
-  onDecode?: (frame: Uint8Array) => void;
-}
-
-// Add new interfaces for RTVI messages
-interface RTVIUserStartedSpeakingMessage {
-  type: "rtvi:user:started_speaking";
-}
-
-interface RTVIUserStoppedSpeakingMessage {
-  type: "rtvi:user:stopped_speaking";
-}
-
-interface RTVIBotStartedSpeakingMessage {
-  type: "rtvi:bot:started_speaking";
-}
-
-interface RTVIBotStoppedSpeakingMessage {
-  type: "rtvi:bot:stopped_speaking";
-}
-
-// Update TransportCallbacks interface
 interface TransportCallbacks {
-  // Existing callbacks
   onGenericMessage?: (data: unknown) => void;
   onMessageError?: (message: RTVIMessage) => void;
   onError?: (message: RTVIMessage) => void;
@@ -83,91 +63,51 @@ interface TransportCallbacks {
   onBotStoppedSpeaking?: () => void;
   onServerMessage?: (data: any) => void;
   onTransportStateChanged?: (state: TransportState) => void;
-
-  // New VAD callbacks
   onVADStateChanged?: (state: "SPEAKING" | "QUIET") => void;
   onEnergyLevelChanged?: (level: number) => void;
 }
 
 export class WebsocketTransport extends Transport {
-  private _websocket: WebSocket | null = null;
+  private static readonly SAMPLE_RATE = 16000;
+  private static readonly NUM_CHANNELS = 1;
+  private static readonly MAX_RECONNECT_ATTEMPTS = 5;
+  private static readonly BASE_RECONNECT_DELAY_MS = 1000;
+
+  private _ws: WebSocket | null = null;
+  private audioProcessor: AudioProcessor;
+  private _eventEmitter: EventEmitter;
+  private reconnectAttempts = 0;
+  private _internalState: TransportState = 'disconnected';
   private _audioContext: AudioContext | null = null;
-  private _frameRef: protobuf.Type | null = null;
-
-  // Microphone handling
   private _mediaStream: MediaStream | null = null;
-  private _audioWorkletNode: AudioWorkletNode | null = null;
   private _audioSource: MediaStreamAudioSourceNode | null = null;
+  private _audioWorkletNode: AudioWorkletNode | null = null;
+  private _frameRef: protobuf.Type | null = null;
+  private _isMicEnabledInternal = false;
+  private _isCamEnabledInternal = false;
+  private _isScreenShareEnabledInternal = false;
+  private _userIsSpeaking = false;
+  private _botIsSpeaking = false;
+  private _playTime = 0;
+  private _lastMessageTime = 0;
+  protected _callbacks: TransportCallbacks = {};
+  protected _onMessage: (message: RTVIMessage) => void = () => {};
+  private userSpeakingTimeout: NodeJS.Timeout | null = null;
+  private botSpeakingTimeout: NodeJS.Timeout | null = null;
+  private _serverUrl: string;
+  private _apiKey?: string;
 
-  // Audio Playback
-  private _playTime: number = 0;
-  private _lastMessageTime: number = 0;
-  private readonly PLAY_TIME_RESET_THRESHOLD_MS: number = 1.0;
-
-  // Server connection
-  private readonly _serverUrl: string;
-  private readonly SAMPLE_RATE = 16000;
-  private readonly NUM_CHANNELS = 1;
-
-  // Reconnection logic
-  private _reconnectAttempts: number = 0;
-  private readonly MAX_RECONNECT_ATTEMPTS = 5;
-  private readonly BASE_RECONNECT_DELAY_MS = 1000;
-
-  // Callback and options management
-  protected _callbacks: NonNullable<RTVIClientOptions["callbacks"]> = {};
-  protected declare _options: RTVIClientOptions;
-  protected declare _onMessage: (ev: RTVIMessage) => void;
-  private _internalState: TransportState = "disconnected";
-
-  // Internal flags for mic/cam/screen state
-  private _isMicEnabledInternal: boolean = false;
-  private _isCamEnabledInternal: boolean = false;
-  private _isScreenShareEnabledInternal: boolean = false;
-
-  // Speech detection
-  private _userIsSpeaking: boolean = false;
-  private _botIsSpeaking: boolean = false;
-
-  // Speech detection parameters
-  private readonly SPEECH_THRESHOLD = -25; // dB threshold for speech detection
-  private readonly SPEECH_END_THRESHOLD = -35; // dB threshold for speech end
-  private readonly MIN_SPEECH_SAMPLES = 5; // Minimum samples to confirm speech
-  private _consecutiveSpeechSamples: number = 0;
-  private _consecutiveSilenceSamples: number = 0;
-  private readonly SPEECH_DETECTION_TIMEOUT_MS = 1000;
-  private _lastSpeechEndTime = 0;
-  private _lastBotSpeechEndTime = 0;
-  private _botSpeechEndTimeout: ReturnType<typeof setTimeout> | null = null;
-
-  // Bot speaking detection
-  private botSpeakingTimeout: ReturnType<typeof setTimeout> | null = null;
-  private lastAudioReceived: number = 0;
-  private isBotCurrentlySpeaking: boolean = false;
-  private BOT_SPEECH_TIMEOUT_MS = 300; // Consider bot stopped speaking after 300ms of no audio
-
-  // Add new properties
-  private isUserSpeaking: boolean = false;
-  private userSpeakingTimeout: ReturnType<typeof setTimeout> | null = null;
-  private readonly VAD_SILENCE_THRESHOLD = 300; // ms
-
-  // FIXED: Constructor now accepts proper options
-  constructor(options: WebsocketTransportParams | string) {
+  constructor(params: WebsocketTransportParams) {
     super();
-    
-    // Handle both string URL and options object for backward compatibility
-    if (typeof options === 'string') {
-      this._serverUrl = options;
-    } else {
-      this._serverUrl = options.url;
-    }
-    
-    if (!this._serverUrl) {
-      throw new Error("WebSocket server URL must be provided");
-    }
+    this._serverUrl = params.url;
+    this._apiKey = params.apiKey;
+    this.audioProcessor = new AudioProcessor({
+      sampleRate: WebsocketTransport.SAMPLE_RATE,
+      channelCount: WebsocketTransport.NUM_CHANNELS
+    });
+    this._eventEmitter = new EventEmitter();
   }
 
-  // State getter and setter
   get state(): TransportState {
     return this._internalState;
   }
@@ -182,17 +122,321 @@ export class WebsocketTransport extends Transport {
       }
 
       // Clean up when disconnecting/erroring
-      if (
-        (newState === "disconnected" || newState === "error") &&
-        this._isMicEnabledInternal
-      ) {
+      if ((newState === "disconnected" || newState === "error") && this._isMicEnabledInternal) {
         this.enableMic(false).catch((err) =>
-          console.error(
-            "[Transport] Error stopping mic on disconnect/error state:",
-            err,
-          ),
+          console.error("[Transport] Error stopping mic on disconnect/error state:", err)
         );
       }
+    }
+  }
+
+  async connect(authBundle?: Record<string, unknown>, abortController?: AbortController): Promise<void> {
+    if (this.state === "connecting" || this.state === "connected" || this.state === "ready") {
+      this.log(`Already in state: ${this.state}, no need to reconnect.`);
+      return;
+    }
+
+    try {
+      this.state = "connecting";
+      this.log('Connecting to WebSocket...');
+
+      // Create WebSocket URL with apiKey if available
+      const wsUrl = new URL(this._serverUrl);
+      if (this._apiKey) {
+        wsUrl.searchParams.append('apiKey', this._apiKey);
+      }
+
+      this.log('Connecting to WebSocket server:', wsUrl.toString());
+
+      // Initialize WebSocket first
+      this._ws = new WebSocket(wsUrl.toString());
+      this._ws.binaryType = "arraybuffer";
+
+      // Set up message handler before onopen
+      this._ws.onmessage = (event: MessageEvent) => {
+        try {
+          if (event.data instanceof ArrayBuffer) {
+            this.handleBinaryMessage(event.data);
+          } else if (typeof event.data === "string") {
+            this.handleTextMessage(event.data);
+          }
+        } catch (error) {
+          console.error("[Transport] Error handling message:", error);
+          if (this._callbacks.onError) {
+            this._callbacks.onError(RTVIMessage.error("Error handling message"));
+          }
+        }
+      };
+
+      this._ws.onopen = async () => {
+        this.log('WebSocket connection established.');
+        this.reconnectAttempts = 0;
+        this.state = "connected";
+        
+        // Initialize audio after WebSocket is connected
+        try {
+          await this.initializeAudio();
+          
+          // Send ready message as binary
+          this.sendReadyMessageBinary();
+          
+          if (this._callbacks.onConnected) {
+            this._callbacks.onConnected();
+          }
+        } catch (error) {
+          console.error("[Transport] Error initializing audio:", error);
+          if (this._callbacks.onError) {
+            this._callbacks.onError(RTVIMessage.error("Failed to initialize audio"));
+          }
+        }
+      };
+
+      this._ws.onclose = (event: CloseEvent) => {
+        console.log(`[Transport] WebSocket connection closed. Code: ${event.code}, Reason: "${event.reason}"`);
+        this.state = "disconnected";
+
+        if (this._callbacks.onDisconnected) {
+          this._callbacks.onDisconnected();
+        }
+
+        if (!event.wasClean && this.reconnectAttempts < WebsocketTransport.MAX_RECONNECT_ATTEMPTS) {
+          const delay = this.calculateReconnectDelay();
+          setTimeout(() => {
+            this.connect(authBundle, new AbortController());
+          }, delay);
+          this.reconnectAttempts++;
+        }
+      };
+
+      this._ws.onerror = (event: Event) => {
+        console.error("[Transport] WebSocket error:", event);
+        this.state = "error";
+        if (this._callbacks.onError) {
+          this._callbacks.onError(RTVIMessage.error("WebSocket connection error"));
+        }
+      };
+
+    } catch (error) {
+      this.log('Connection error:', error);
+      this.state = "error";
+      this.cleanup();
+      throw error;
+    }
+  }
+
+  async disconnect(): Promise<void> {
+    console.log("[Transport] Disconnecting...");
+    this.state = "disconnecting";
+
+    if (this._isMicEnabledInternal) {
+      await this.enableMic(false);
+    }
+
+    if (this._ws) {
+      if (this._ws.readyState === WebSocket.OPEN || this._ws.readyState === WebSocket.CONNECTING) {
+        this._ws.close(1000, "Client initiated disconnect");
+      }
+      this._ws = null;
+    }
+
+    if (this._audioContext && this._audioContext.state === "running") {
+      try {
+        await this._audioContext.suspend();
+      } catch (suspendError) {
+        console.error("[Transport] Error suspending AudioContext:", suspendError);
+      }
+    }
+
+    this.state = "disconnected";
+    console.log("[Transport] Disconnected.");
+  }
+
+  private calculateReconnectDelay(): number {
+    const baseDelay = WebsocketTransport.BASE_RECONNECT_DELAY_MS * Math.pow(2, this.reconnectAttempts);
+    const maxDelay = 30000;
+    const jitter = Math.random() * 0.3 + 0.85;
+    return Math.min(baseDelay * jitter, maxDelay);
+  }
+
+  private async initializeAudio(): Promise<void> {
+    try {
+      if (!this._audioContext) {
+        this._audioContext = new AudioContext({
+          sampleRate: WebsocketTransport.SAMPLE_RATE,
+          latencyHint: 'interactive'
+        });
+      }
+
+      // Resume audio context if suspended
+      if (this._audioContext.state === "suspended") {
+        await this._audioContext.resume();
+      }
+
+      // Get user media with proper constraints
+      this._mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          sampleRate: WebsocketTransport.SAMPLE_RATE,
+          channelCount: WebsocketTransport.NUM_CHANNELS,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
+
+      // Create audio source
+      this._audioSource = this._audioContext.createMediaStreamSource(this._mediaStream);
+
+      // Load audio worklet
+      const workletUrl = new URL('/audio-processor.js', window.location.origin).href;
+      await this._audioContext.audioWorklet.addModule(workletUrl);
+      
+      // Create and connect audio worklet
+      this._audioWorkletNode = new AudioWorkletNode(this._audioContext, 'audio-processor', {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        channelCount: WebsocketTransport.NUM_CHANNELS,
+        channelCountMode: 'explicit',
+        channelInterpretation: 'speakers',
+        processorOptions: {
+          sampleRate: WebsocketTransport.SAMPLE_RATE,
+          bufferSize: 4096
+        }
+      });
+
+      // Connect audio nodes
+      this._audioSource.connect(this._audioWorkletNode);
+      this._audioWorkletNode.connect(this._audioContext.destination);
+
+      // Set up audio data handling
+      this._audioWorkletNode.port.onmessage = (event) => {
+        if (event.data.type === 'audioData') {
+          const audioData = event.data.audioData;
+          if (audioData && audioData.length > 0) {
+            // Convert Float32Array to Int16Array
+            const int16Array = new Int16Array(audioData.length);
+            for (let i = 0; i < audioData.length; i++) {
+              const val = Math.max(-1, Math.min(1, audioData[i]));
+              int16Array[i] = val < 0 ? val * 32768 : val * 32767;
+            }
+            this.sendAudioData(int16Array);
+          }
+        } else if (event.data.type === 'vadState') {
+          this.handleVADState(event.data.state);
+        }
+      };
+
+      this.log('Audio initialized successfully');
+    } catch (error) {
+      this.log('Failed to initialize audio:', error);
+      throw error;
+    }
+  }
+
+  private handleVADState(state: "SPEAKING" | "QUIET"): void {
+    if (state === "SPEAKING") {
+      this._userIsSpeaking = true;
+      if (this._callbacks.onUserStartedSpeaking) {
+        this._callbacks.onUserStartedSpeaking();
+      }
+      window.dispatchEvent(new CustomEvent(RTVIEvent.UserStartedSpeaking));
+    } else {
+      this._userIsSpeaking = false;
+      if (this._callbacks.onUserStoppedSpeaking) {
+        this._callbacks.onUserStoppedSpeaking();
+      }
+      window.dispatchEvent(new CustomEvent(RTVIEvent.UserStoppedSpeaking));
+    }
+
+    if (this._callbacks.onVADStateChanged) {
+      this._callbacks.onVADStateChanged(state);
+    }
+  }
+
+  private handleAudioFrame(audioData: Uint8Array): void {
+    try {
+      if (!this._audioContext) {
+        console.error("[Transport] AudioContext not initialized");
+        return;
+      }
+
+      // Convert Uint8Array to Float32Array for Web Audio API
+      const float32Array = new Float32Array(audioData.length / 2);
+      const int16Array = new Int16Array(audioData.buffer);
+      
+      for (let i = 0; i < int16Array.length; i++) {
+        float32Array[i] = int16Array[i] / 32768.0;
+      }
+
+      // Create audio buffer
+      const audioBuffer = this._audioContext.createBuffer(
+        1, // mono
+        float32Array.length,
+        WebsocketTransport.SAMPLE_RATE
+      );
+      audioBuffer.copyToChannel(float32Array, 0);
+
+      // Create and connect audio nodes
+      const source = this._audioContext.createBufferSource();
+      source.buffer = audioBuffer;
+
+      const gainNode = this._audioContext.createGain();
+      gainNode.gain.setValueAtTime(1, this._audioContext.currentTime);
+
+      source.connect(gainNode);
+      gainNode.connect(this._audioContext.destination);
+
+      // Schedule playback
+      const currentTime = this._audioContext.currentTime;
+      const scheduledTime = Math.max(this._playTime, currentTime + 0.05);
+      source.start(scheduledTime);
+      this._playTime = scheduledTime + audioBuffer.duration;
+
+      // Update bot speaking state
+      this._botIsSpeaking = true;
+      if (this._callbacks.onBotStartedSpeaking) {
+        this._callbacks.onBotStartedSpeaking();
+      }
+      window.dispatchEvent(
+        new CustomEvent("bot-speaking-state-changed", {
+          detail: { isSpeaking: true },
+        })
+      );
+
+      source.onended = () => {
+        this._botIsSpeaking = false;
+        if (this._callbacks.onBotStoppedSpeaking) {
+          this._callbacks.onBotStoppedSpeaking();
+        }
+        window.dispatchEvent(
+          new CustomEvent("bot-speaking-state-changed", {
+            detail: { isSpeaking: false },
+          })
+        );
+      };
+    } catch (error) {
+      console.error("[Transport] Error handling audio frame:", error);
+    }
+  }
+
+  private sendAudioData(audioData: Int16Array): void {
+    if (!this._ws || this._ws.readyState !== WebSocket.OPEN || !this._frameRef) {
+      return;
+    }
+
+    try {
+      // Create frame with proper audio format
+      const frame = this._frameRef.create({
+        audio: {
+          audio: Array.from(new Uint8Array(audioData.buffer)),
+          sampleRate: WebsocketTransport.SAMPLE_RATE,
+          numChannels: WebsocketTransport.NUM_CHANNELS
+        }
+      });
+
+      const encodedFrame = new Uint8Array(this._frameRef.encode(frame).finish());
+      this._ws.send(encodedFrame);
+    } catch (error) {
+      console.error("[Transport] Error sending audio data:", error);
     }
   }
 
@@ -205,7 +449,6 @@ export class WebsocketTransport extends Transport {
     this._onMessage = messageHandler;
     this.state = "initializing";
 
-    // Initialize internal flags from options
     this._isMicEnabledInternal = !!options.enableMic;
     this._isCamEnabledInternal = !!options.enableCam;
 
@@ -218,7 +461,6 @@ export class WebsocketTransport extends Transport {
       }
 
       try {
-        // Load protobuf definitions directly as a string
         const protoDefinition = `
           syntax = "proto3";
           package pipecat;
@@ -275,14 +517,13 @@ export class WebsocketTransport extends Transport {
         this._audioContext = new (window.AudioContext ||
           (window as any).webkitAudioContext)({
           latencyHint: "interactive",
-          sampleRate: this.SAMPLE_RATE,
+          sampleRate: WebsocketTransport.SAMPLE_RATE,
         });
         console.log(
           "[Transport] AudioContext initialized with sample rate:",
           this._audioContext.sampleRate,
         );
 
-        // Load the audio worklet if we're in a browser context
         if (
           typeof window !== "undefined" &&
           "audioWorklet" in this._audioContext
@@ -320,384 +561,133 @@ export class WebsocketTransport extends Transport {
     }
   }
 
-  async connect(
-    authBundle: Record<string, unknown> | undefined,
-    abortController: AbortController,
-  ): Promise<void> {
-    if (
-      this.state === "connecting" ||
-      this.state === "connected" ||
-      this.state === "ready"
-    ) {
-      console.log(
-        `[Transport] Already in state: ${this.state}, no need to reconnect.`,
-      );
+  private handleBinaryMessage(data: ArrayBuffer): void {
+    try {
+      if (!this._frameRef) {
+        console.error("[Transport] Frame reference not initialized");
+        return;
+      }
+
+      const decodedMessage = this._frameRef.decode(new Uint8Array(data));
+      const frame = this.decodeFrame(decodedMessage);
+
+      if (frame.audio) {
+        this.handleAudioFrame(new Uint8Array(frame.audio.audio as number[]));
+      } else if (frame.text) {
+        this.handleTextFrame(frame.text);
+      }
+    } catch (error) {
+      console.error("[Transport] Error processing binary message:", error);
+    }
+  }
+
+  private handleTextMessage(data: string): void {
+    try {
+      const jsonData = JSON.parse(data);
+      
+      if (jsonData.type === "error") {
+        console.error("[Transport] Server error:", jsonData.message);
+        if (this._callbacks.onError) {
+          this._callbacks.onError(RTVIMessage.error(jsonData.message));
+        }
+        return;
+      }
+
+      if (jsonData.type === "server-ready") {
+        this.log("[Transport] Received server ready acknowledgment");
+        return;
+      }
+
+      if (this._callbacks.onServerMessage) {
+        this._callbacks.onServerMessage(jsonData);
+      }
+    } catch (error) {
+      console.warn("[Transport] Non-JSON text message:", data);
+    }
+  }
+
+  private handleTextFrame(frame: any): void {
+    try {
+      const textData = JSON.parse(frame.text);
+      
+      if (textData.type === "greeting") {
+        // Handle initial greeting
+        window.dispatchEvent(
+          new CustomEvent("chat-message", {
+            detail: {
+              id: crypto.randomUUID(),
+              content: textData.content,
+              role: textData.role || "assistant",
+              timestamp: new Date(textData.timestamp || Date.now()),
+            },
+          })
+        );
+      } else if (textData.type === "transcript" || textData.type === "transcript_update") {
+        window.dispatchEvent(
+          new CustomEvent("chat-message", {
+            detail: {
+              id: crypto.randomUUID(),
+              content: textData.content,
+              role: textData.role || "assistant",
+              timestamp: new Date(textData.timestamp || Date.now()),
+            },
+          })
+        );
+      }
+
+      if (this._callbacks.onServerMessage) {
+        this._callbacks.onServerMessage(textData);
+      }
+    } catch (error) {
+      console.error("[Transport] Error handling text frame:", error);
+    }
+  }
+
+  private sendReadyMessageBinary(): void {
+    if (!this._ws || this._ws.readyState !== WebSocket.OPEN || !this._frameRef) {
+      this.log("[Transport.sendReadyMessage] WebSocket not ready");
       return;
     }
-
-    console.log("[Transport] Connecting to WebSocket server:", this._serverUrl);
-    this.state = "connecting";
-    this._reconnectAttempts = 0;
 
     try {
-      if (this._audioContext && this._audioContext.state === "suspended") {
-        console.log("[Transport] Resuming AudioContext...");
-        await this._audioContext.resume();
-        console.log("[Transport] AudioContext resumed.");
-      }
-
-      this._websocket = new WebSocket(this._serverUrl);
-      this._websocket.binaryType = "arraybuffer";
-
-      abortController.signal.addEventListener("abort", () => {
-        console.log("[Transport] Connection attempt aborted by controller.");
-        if (
-          this._websocket &&
-          (this._websocket.readyState === WebSocket.CONNECTING ||
-            this._websocket.readyState === WebSocket.OPEN)
-        ) {
-          this._websocket.close(1000, "Connection aborted by client");
-        }
-        this.state = "disconnected";
-      });
-
-      this._websocket.onopen = () => {
-        console.log("[Transport] WebSocket connection established.");
-        this._reconnectAttempts = 0;
-        this.state = "connected";
-        this.sendReadyMessage();
-        
-        // FIXED: Call onConnected callback
-        if (this._callbacks.onConnected) {
-          this._callbacks.onConnected();
-        }
-      };
-
-      this._websocket.onmessage = (event: MessageEvent) => {
-        this.handleWebSocketMessage(event);
-      };
-
-      this._websocket.onclose = (event: CloseEvent) => {
-        console.log(
-          `[Transport] WebSocket connection closed. Code: ${event.code}, Reason: "${event.reason}", WasClean: ${event.wasClean}`,
-        );
-        this.state = "disconnected";
-
-        if (this._callbacks.onDisconnected) {
-          this._callbacks.onDisconnected();
-        }
-
-        // Attempt to reconnect if not a clean closure
-        if (
-          !event.wasClean &&
-          this._reconnectAttempts < this.MAX_RECONNECT_ATTEMPTS
-        ) {
-          const delay = this.calculateReconnectDelay();
-          console.log(
-            `[Transport] Attempting to reconnect in ${delay}ms (attempt ${this._reconnectAttempts + 1}/${this.MAX_RECONNECT_ATTEMPTS})`,
-          );
-          setTimeout(() => {
-            this.connect(authBundle, new AbortController());
-          }, delay);
-          this._reconnectAttempts++;
-        }
-      };
-
-      this._websocket.onerror = (event: Event) => {
-        console.error("[Transport] WebSocket error:", event);
-        this.state = "error";
-        if (this._callbacks.onError)
-          this._callbacks.onError(
-            RTVIMessage.error("WebSocket connection error"),
-          );
-      };
-    } catch (error) {
-      console.error("[Transport] Error during connect sequence:", error);
-      this.state = "error";
-      if (this._callbacks.onError)
-        this._callbacks.onError(
-          RTVIMessage.error(
-            `Connection setup failed: ${error instanceof Error ? error.message : String(error)}`,
-          ),
-        );
-      throw error;
-    }
-  }
-
-  private calculateReconnectDelay(): number {
-    // Exponential backoff with jitter
-    const baseDelay =
-      this.BASE_RECONNECT_DELAY_MS * Math.pow(2, this._reconnectAttempts);
-    const maxDelay = 30000; // 30 seconds max
-    const jitter = Math.random() * 0.3 + 0.85; // Random value between 0.85 and 1.15
-    return Math.min(baseDelay * jitter, maxDelay);
-  }
-
-  async disconnect(): Promise<void> {
-    console.log("[Transport] Disconnecting...");
-    this.state = "disconnecting";
-
-    if (this._isMicEnabledInternal) {
-      await this.enableMic(false);
-    }
-
-    if (this._websocket) {
-      if (
-        this._websocket.readyState === WebSocket.OPEN ||
-        this._websocket.readyState === WebSocket.CONNECTING
-      ) {
-        this._websocket.close(1000, "Client initiated disconnect");
-      }
-      this._websocket = null;
-    }
-
-    if (this._audioContext && this._audioContext.state === "running") {
-      console.log("[Transport] Suspending AudioContext.");
-      try {
-        await this._audioContext.suspend();
-      } catch (suspendError) {
-        console.error(
-          "[Transport] Error suspending AudioContext:",
-          suspendError,
-        );
-      }
-    }
-
-    this.state = "disconnected";
-    console.log("[Transport] Disconnected.");
-  }
-
-  private handleWebSocketMessage(event: MessageEvent): void {
-    this._lastMessageTime = Date.now();
-
-    // Handle binary messages (audio frames)
-    if (event.data instanceof ArrayBuffer) {
-      try {
-        if (!this._frameRef) {
-          console.error(
-            "[Transport] Frame reference not initialized, cannot decode binary message",
-          );
-          return;
-        }
-
-        const decodedMessage = this._frameRef.decode(
-          new Uint8Array(event.data),
-        );
-        const frame = this.decodeFrame(decodedMessage);
-
-        // Handle audio frames for playback
-        if (frame && frame.audio) {
-          const audioData = new Uint8Array(frame.audio.audio as number[]);
-
-          // Reset play time if there's been a significant gap
-          const currentTime = this._audioContext!.currentTime;
-          if (currentTime - this._playTime > 0.5) {
-            this._playTime = currentTime;
-          }
-
-          this._audioContext!.decodeAudioData(
-            audioData.buffer,
-            (buffer) => {
-              // Create and configure source node
-              const source = this._audioContext!.createBufferSource();
-              source.buffer = buffer;
-
-              // Add a small delay to ensure proper sequencing
-              const scheduledTime = Math.max(
-                this._playTime,
-                currentTime + 0.05,
-              );
-
-              // Create a gain node for smooth transitions
-              const gainNode = this._audioContext!.createGain();
-              gainNode.gain.setValueAtTime(1, scheduledTime);
-
-              // Connect nodes
-              source.connect(gainNode);
-              gainNode.connect(this._audioContext!.destination);
-
-              // Start playback
-              source.start(scheduledTime);
-              this._playTime = scheduledTime + buffer.duration;
-
-              // Update bot speaking state
-              this._botIsSpeaking = true;
-              window.dispatchEvent(
-                new CustomEvent("bot-speaking-state-changed", {
-                  detail: { isSpeaking: true },
-                }),
-              );
-
-              // Set timeout to mark end of speech
-              source.onended = () => {
-                this._botIsSpeaking = false;
-                window.dispatchEvent(
-                  new CustomEvent("bot-speaking-state-changed", {
-                    detail: { isSpeaking: false },
-                  }),
-                );
-              };
-            },
-            (error) => {
-              console.error("[Transport] Error decoding audio data:", error);
-            },
-          );
-        }
-      } catch (error) {
-        console.error("[Transport] Error processing binary message:", error);
-      }
-      return;
-    }
-
-    // Handle text messages
-    if (typeof event.data === "string") {
-      try {
-        const jsonData = JSON.parse(event.data);
-
-        // Handle transcript updates and regular messages consistently
-        if (
-          jsonData.type === "transcript" ||
-          jsonData.type === "transcript_update"
-        ) {
-          window.dispatchEvent(
-            new CustomEvent("chat-message", {
-              detail: {
-                id: crypto.randomUUID(),
-                content: jsonData.content,
-                role: jsonData.role || "assistant",
-                timestamp: new Date(jsonData.timestamp || Date.now()),
-              },
-            }),
-          );
-        }
-
-        // FIXED: Handle RTVI messages properly
-        if (jsonData.type && jsonData.type.startsWith('rtvi:')) {
-          this.handleRTVIMessage(jsonData);
-        }
-
-        // Pass the message to client callbacks
-        if (this._onMessage) {
-          this._onMessage({
-            type: jsonData.type || "text",
-            data: jsonData,
+      const readyPayload = {
+        text: {
+          text: JSON.stringify({
+            label: "rtvi-ai",
+            type: "client-ready",
             id: crypto.randomUUID(),
-            label: "server_message",
-          } as RTVIMessage);
+            timestamp: new Date().toISOString(),
+            agent_config: {
+              model: "gpt-4",
+              temperature: 0.7,
+              max_tokens: 150,
+              stream: true,
+              voice: "alloy",
+              response_format: { type: "text" },
+              sample_rate: WebsocketTransport.SAMPLE_RATE,
+              num_channels: WebsocketTransport.NUM_CHANNELS,
+              audio: {
+                sample_rate: WebsocketTransport.SAMPLE_RATE,
+                num_channels: WebsocketTransport.NUM_CHANNELS,
+                format: "pcm16"
+              }
+            }
+          })
         }
-      } catch (jsonError) {
-        console.warn("[Transport] Non-JSON text message:", event.data);
-      }
-    }
-  }
+      };
 
-  // FIXED: Proper sendMessage implementation
-  public sendMessage(message: RTVIMessage): void {
-    if (!this._websocket || this._websocket.readyState !== WebSocket.OPEN) {
-      console.error("[Transport.sendMessage] WebSocket not connected");
-      if (this._callbacks.onError) {
-        this._callbacks.onError(RTVIMessage.error("WebSocket not connected"));
-      }
-      return;
-    }
-
-    try {
-      // Handle different message types
-      if (message.type === "client-audio") {
-        // Handle audio messages through protobuf
-        this.send(message).catch(error => {
-          console.error("[Transport.sendMessage] Error sending audio message:", error);
-        });
-      } else {
-        // Handle text and other messages
-        const messageData = message.data as RTVIMessageData;
-        
-        const outgoingMessage = {
-          type: message.type,
-          text: messageData.text || messageData.content || "",
-          timestamp: new Date().toISOString(),
-        };
-
-        this._websocket.send(JSON.stringify(outgoingMessage));
-        console.log("[Transport.sendMessage] Message sent:", message.type);
-      }
-    } catch (error) {
-      console.error("[Transport.sendMessage] Error sending message:", error);
-      if (this._callbacks.onError) {
-        this._callbacks.onError(RTVIMessage.error("Failed to send message"));
-      }
-    }
-  }
-
-  public sendReadyMessage(): void {
-    console.log("[Transport.sendReadyMessage] Called.");
-    if (this.state === "connected") {
+      const frame = this._frameRef.create(readyPayload);
+      const encoded = new Uint8Array(this._frameRef.encode(frame).finish());
+      this._ws.send(encoded);
+      
       this.state = "ready";
-      console.log(
-        "[Transport] sendReadyMessage: Transitioned internal state to ready.",
-      );
-    } else {
-      console.warn(
-        "[Transport.sendReadyMessage] Called when not connected. State:",
-        this.state,
-      );
-    }
-  }
-
-  public async send(message: RTVIMessage): Promise<void> {
-    if (!this._websocket || this._websocket.readyState !== WebSocket.OPEN) {
-      console.warn(
-        "[Transport.send] WebSocket not connected or not open. State:",
-        this._websocket?.readyState,
-      );
-      return Promise.reject(
-        new Error("WebSocket not connected or not open. Cannot send message."),
-      );
-    }
-    if (!this._frameRef) {
-      console.warn("[Transport.send] Protobuf _frameRef not initialized.");
-      return Promise.reject(
-        new Error("Protobuf _frameRef not initialized. Cannot send message."),
-      );
-    }
-
-    try {
-      const messageType = message.type;
-      const messageData = (message as any).data;
-
-      if (messageType === "text" && typeof messageData === "string") {
-        this.sendTextMessageProto(messageData);
-      } else if (
-        messageType === "text" &&
-        typeof messageData?.text === "string"
-      ) {
-        this.sendTextMessageProto(messageData.text);
-      } else {
-        console.warn(
-          `[Transport.send] Unhandled message type '${messageType}' or unexpected data structure.`,
-        );
-        return Promise.reject(
-          new Error(`Unhandled message type: ${messageType}`),
-        );
-      }
-      return Promise.resolve();
+      this.log("[Transport] Ready message sent successfully");
     } catch (error) {
-      console.error(
-        "[Transport.send] Error processing/sending message:",
-        error,
-      );
-      return Promise.reject(error);
+      console.error("[Transport] Error sending ready message:", error);
+      if (this._callbacks.onError) {
+        this._callbacks.onError(RTVIMessage.error("Failed to send ready message"));
+      }
     }
-  }
-
-  private sendTextMessageProto(text: string): void {
-    const textFrameData = { text: text };
-    const frameToSend = this._frameRef!.create({ text: textFrameData });
-    const encodedFrame = new Uint8Array(
-      this._frameRef!.encode(frameToSend).finish(),
-    );
-    this._websocket!.send(encodedFrame);
-    console.log(`[Transport] Sent text message: "${text}"`);
   }
 
   private convertFloat32ToS16PCM(float32Data: Float32Array): Int16Array {
@@ -709,58 +699,70 @@ export class WebsocketTransport extends Transport {
     return int16Array;
   }
 
-  public async enableMic(enable: boolean): Promise<void> {
-    console.log(`[Transport] ${enable ? "Enabling" : "Disabling"} microphone.`);
+  public async enableMic(enabled: boolean): Promise<void> {
+    if (this._isMicEnabledInternal === enabled) return;
 
-    if (enable) {
+    try {
+      if (enabled) {
+        console.log("[Transport] Enabling microphone.");
+
+        // Initialize AudioContext only after user interaction
       if (!this._audioContext) {
-        console.error(
-          "[Transport] AudioContext not available. Cannot enable mic.",
-        );
-        throw new Error("AudioContext not available.");
-      }
-
-      if (this._isMicEnabledInternal && this._mediaStream) {
-        console.log("[Transport] Microphone already enabled.");
-        return;
-      }
-
-      try {
-        // Ensure AudioContext is running
-        if (this._audioContext.state === "suspended") {
-          await this._audioContext.resume();
+          this._audioContext = new AudioContext({
+            sampleRate: 16000,
+            latencyHint: 'interactive'
+          });
         }
 
         // Request microphone access
         this._mediaStream = await navigator.mediaDevices.getUserMedia({
           audio: {
-            sampleRate: this.SAMPLE_RATE,
-            channelCount: this.NUM_CHANNELS,
+            sampleRate: 16000,
+            channelCount: 1,
             echoCancellation: true,
             noiseSuppression: true,
-            autoGainControl: true,
-          },
+            autoGainControl: true
+          }
         });
 
-        // Create audio source from microphone stream
-        this._audioSource = this._audioContext.createMediaStreamSource(
-          this._mediaStream,
-        );
+        // Create audio worklet
+        try {
+          await this._audioContext.audioWorklet.addModule('/audio-processor.js');
+          this._audioWorkletNode = new AudioWorkletNode(this._audioContext, 'audio-processor');
+        } catch (error) {
+          console.warn("[Transport] Failed to load audio worklet, will fallback to script processor:", error);
+          // Fallback to ScriptProcessorNode if worklet fails
+          const scriptNode = this._audioContext.createScriptProcessor(4096, 1, 1);
+          scriptNode.onaudioprocess = (e) => {
+            const inputData = e.inputBuffer.getChannelData(0);
+            // Process audio data here
+          };
+          this._audioWorkletNode = scriptNode as unknown as AudioWorkletNode;
+        }
 
+        // Connect audio nodes
+        const source = this._audioContext.createMediaStreamSource(this._mediaStream);
+        source.connect(this._audioWorkletNode);
+        this._audioWorkletNode.connect(this._audioContext.destination);
 
         this._isMicEnabledInternal = true;
         console.log("[Transport] Microphone enabled successfully.");
-      } catch (err) {
-        console.error("[Transport] Error enabling microphone:", err);
-        this._isMicEnabledInternal = false;
-        this.cleanupAudioResources();
-        throw err;
-      }
     } else {
-      // Disable microphone
-      this.cleanupAudioResources();
+        console.log("[Transport] Disabling microphone.");
+        if (this._mediaStream) {
+          this._mediaStream.getTracks().forEach(track => track.stop());
+          this._mediaStream = null;
+        }
+        if (this._audioWorkletNode) {
+          this._audioWorkletNode.disconnect();
+          this._audioWorkletNode = null;
+        }
       this._isMicEnabledInternal = false;
       console.log("[Transport] Microphone disabled.");
+      }
+    } catch (error) {
+      console.error("[Transport] Error toggling microphone:", error);
+      throw error;
     }
   }
 
@@ -776,14 +778,11 @@ export class WebsocketTransport extends Transport {
       return;
     }
 
-    // NOTE: ScriptProcessorNode is deprecated, but we use it as a fallback
     const scriptProcessor = this._audioContext.createScriptProcessor(512, 1, 1);
 
-    // Connect the audio pipeline
     this._audioSource.connect(scriptProcessor);
     scriptProcessor.connect(this._audioContext.destination);
 
-    // Process audio data when available
     scriptProcessor.onaudioprocess = (event) => {
       const audioData = event.inputBuffer.getChannelData(0);
       this.processAudioData(audioData);
@@ -792,30 +791,28 @@ export class WebsocketTransport extends Transport {
 
   private processAudioData(audioData: Float32Array): void {
     if (
-      !this._websocket ||
-      this._websocket.readyState !== WebSocket.OPEN ||
+      !this._ws ||
+      this._ws.readyState !== WebSocket.OPEN ||
       !this._frameRef
     ) {
       return;
     }
 
-    // Send the audio data to the server
     const pcmS16ArrayForSending = this.convertFloat32ToS16PCM(audioData);
     const pcmByteArrayForSending = new Uint8Array(pcmS16ArrayForSending.buffer);
     const frame = this._frameRef.create({
       audio: {
         audio: Array.from(pcmByteArrayForSending),
-        sampleRate: this.SAMPLE_RATE,
-        numChannels: this.NUM_CHANNELS,
+        sampleRate: WebsocketTransport.SAMPLE_RATE,
+        numChannels: WebsocketTransport.NUM_CHANNELS,
       },
     });
 
     const encodedFrame = new Uint8Array(this._frameRef.encode(frame).finish());
-    this._websocket.send(encodedFrame);
+    this._ws.send(encodedFrame);
   }
 
   private cleanupAudioResources(): void {
-    // Disconnect and clean up AudioWorkletNode if it exists
     if (this._audioWorkletNode) {
       try {
         this._audioWorkletNode.disconnect();
@@ -823,7 +820,6 @@ export class WebsocketTransport extends Transport {
       this._audioWorkletNode = null;
     }
 
-    // Disconnect and clean up AudioSourceNode
     if (this._audioSource) {
       try {
         this._audioSource.disconnect();
@@ -831,7 +827,6 @@ export class WebsocketTransport extends Transport {
       this._audioSource = null;
     }
 
-    // Stop media stream tracks
     if (this._mediaStream) {
       this._mediaStream.getTracks().forEach((track) => track.stop());
       this._mediaStream = null;
@@ -850,7 +845,6 @@ export class WebsocketTransport extends Transport {
     return this._isScreenShareEnabledInternal;
   }
 
-  // Add getters for speech detection
   get userIsSpeaking(): boolean {
     return this._userIsSpeaking;
   }
@@ -859,7 +853,6 @@ export class WebsocketTransport extends Transport {
     return this._botIsSpeaking;
   }
 
-  // Required interface implementations for Transport
   async initDevices(): Promise<void> {
     console.log(
       "[Transport] initDevices called. (No-op in this simplified transport)",
@@ -908,42 +901,34 @@ export class WebsocketTransport extends Transport {
       return {};
     }
   
-    // Method to calculate volume level
     private calculateVolumeLevel(audioData: Float32Array): number {
-      // Skip processing if the array is empty
-      if (audioData.length === 0) return -100; // Return very low volume if no data
+      if (audioData.length === 0) return -100;
   
-      // Calculate RMS (Root Mean Square) volume
       let sumOfSquares = 0;
       for (let i = 0; i < audioData.length; i++) {
         sumOfSquares += audioData[i] * audioData[i];
       }
       const rms = Math.sqrt(sumOfSquares / audioData.length);
   
-      // Apply logarithmic scaling to make the volume level more human-like
-      // Adding a small epsilon to avoid log(0)
       const epsilon = 0.0000001;
       return 20 * Math.log10(Math.max(rms, epsilon));
     }
   
-    // Add this method after handleWebSocketMessage
     private decodeFrame(decodedMessage: any): ParsedPipecatFrame {
       const frame: ParsedPipecatFrame = {};
   
       if (!decodedMessage) return frame;
   
       try {
-        // Convert from protobuf object to our simplified frame
         const frameObj = this._frameRef!.toObject(decodedMessage, {
           defaults: true,
         }) as any;
   
-        // Map different frame types
         if (frameObj.audio && frameObj.audio.audio) {
           frame.audio = {
             audio: frameObj.audio.audio,
-            sampleRate: frameObj.audio.sampleRate || this.SAMPLE_RATE,
-            numChannels: frameObj.audio.numChannels || this.NUM_CHANNELS,
+            sampleRate: frameObj.audio.sampleRate || WebsocketTransport.SAMPLE_RATE,
+            numChannels: frameObj.audio.numChannels || WebsocketTransport.NUM_CHANNELS,
             pts: frameObj.audio.pts,
           };
         }
@@ -977,30 +962,24 @@ export class WebsocketTransport extends Transport {
     }
   
     private monitorAudioQuality(audioData: Float32Array): void {
-      // Calculate audio metrics
       let peakLevel = 0;
       let noiseFloor = Infinity;
       let zeroCrossings = 0;
   
       for (let i = 1; i < audioData.length; i++) {
-        // Track peak level
         peakLevel = Math.max(peakLevel, Math.abs(audioData[i]));
   
-        // Track noise floor
         if (Math.abs(audioData[i]) > 0.0001) {
           noiseFloor = Math.min(noiseFloor, Math.abs(audioData[i]));
         }
   
-        // Count zero crossings (high values indicate noise)
         if (Math.sign(audioData[i]) !== Math.sign(audioData[i - 1])) {
           zeroCrossings++;
         }
       }
   
-      // Calculate zero crossing rate
       const zeroCrossingRate = zeroCrossings / audioData.length;
   
-      // Log warnings if audio quality issues detected
       if (zeroCrossingRate > 0.3) {
         console.warn("[Transport] High frequency noise detected");
       }
@@ -1022,10 +1001,9 @@ export class WebsocketTransport extends Transport {
         return;
       }
   
-      // Pass message through to registered message handler
       this._onMessage(message);
   
-      // Special handling for speaking state messages
+      // Handle speaking states
       if (message.type === "rtvi:user:started_speaking") {
         console.log("[Transport] Received RTVI user started speaking message");
         this.handleUserSpeakingState(true);
@@ -1036,7 +1014,6 @@ export class WebsocketTransport extends Transport {
         console.log("[Transport] Received RTVI bot started speaking message");
         this._botIsSpeaking = true;
   
-        // Clear any existing bot speech timeout
         if (this.botSpeakingTimeout) {
           clearTimeout(this.botSpeakingTimeout);
           this.botSpeakingTimeout = null;
@@ -1061,26 +1038,21 @@ export class WebsocketTransport extends Transport {
   
         if (isSpeaking) {
           console.log("[Transport] User started speaking");
-          // Now RTVIEvent will be properly recognized
           window.dispatchEvent(new CustomEvent(RTVIEvent.UserStartedSpeaking));
   
-          // Clear any existing silence timeout
           if (this.userSpeakingTimeout) {
             clearTimeout(this.userSpeakingTimeout);
             this.userSpeakingTimeout = null;
           }
   
-          // Notify callback
           if (this._callbacks.onUserStartedSpeaking) {
             this._callbacks.onUserStartedSpeaking();
           }
         } else {
           console.log("[Transport] User stopped speaking");
   
-          // Dispatch RTVI event
           window.dispatchEvent(new CustomEvent(RTVIEvent.UserStoppedSpeaking));
   
-          // Notify callback
           if (this._callbacks.onUserStoppedSpeaking) {
             this._callbacks.onUserStoppedSpeaking();
           }
@@ -1095,27 +1067,100 @@ export class WebsocketTransport extends Transport {
       return this._audioContext;
     }
   
-    public async sendTextMessage(text: string): Promise<void> {
-      if (!this._websocket || this._websocket.readyState !== WebSocket.OPEN) {
-        console.error("[Transport] Cannot send text: WebSocket not connected");
+    // public async sendTextMessage(text: string): Promise<void> {
+    //   if (!this._ws || this._ws.readyState !== WebSocket.OPEN) {
+    //     console.error("[Transport] Cannot send text: WebSocket not connected");
+    //     return;
+    //   }
+
+    private log(message: string, ...args: any[]): void {
+      console.log(`[WebsocketTransport] ${message}`, ...args);
+    }
+
+    private cleanup(): void {
+      if (this._ws) {
+        this._ws.close();
+        this._ws = null;
+      }
+
+      if (this._audioWorkletNode) {
+        this._audioWorkletNode.disconnect();
+        this._audioWorkletNode = null;
+      }
+
+      if (this._audioSource) {
+        this._audioSource.disconnect();
+        this._audioSource = null;
+      }
+
+      if (this._mediaStream) {
+        this._mediaStream.getTracks().forEach(track => track.stop());
+        this._mediaStream = null;
+      }
+
+      if (this._audioContext) {
+        this._audioContext.close();
+        this._audioContext = null;
+      }
+    }
+
+    public sendReadyMessage(): void {
+      this.sendReadyMessageBinary();
+    }
+
+    public sendMessage(message: RTVIMessage): void {
+      if (!this._ws || this._ws.readyState !== WebSocket.OPEN) {
+        console.error("[Transport.sendMessage] WebSocket not connected");
+        if (this._callbacks.onError) {
+          this._callbacks.onError(RTVIMessage.error("WebSocket not connected"));
+        }
         return;
       }
-  
+
       try {
-        // Create message payload
-        const messagePayload = {
-          type: "text",
-          content: text,
-          timestamp: new Date().toISOString(),
-          role: "user",
-        };
-  
-        // Send as JSON string
-        this._websocket.send(JSON.stringify(messagePayload));
-        console.log("[Transport] Text message sent:", text);
+        if (message.type === "client-audio") {
+          this.sendAudioMessage(message);
+        } else {
+          this.sendTextMessage(message);
+        }
       } catch (error) {
-        console.error("[Transport] Error sending text message:", error);
+        console.error("[Transport.sendMessage] Error sending message:", error);
+        if (this._callbacks.onError) {
+          this._callbacks.onError(RTVIMessage.error("Failed to send message"));
+        }
       }
+    }
+
+    private sendAudioMessage(message: RTVIMessage): void {
+      if (!this._frameRef) {
+        throw new Error("Frame reference not initialized");
+      }
+
+      const audioData = message.data as { audio: Uint8Array };
+      const frame = this._frameRef.create({
+        audio: {
+          audio: Array.from(audioData.audio),
+          sampleRate: WebsocketTransport.SAMPLE_RATE,
+          numChannels: WebsocketTransport.NUM_CHANNELS
+        }
+      });
+      const encoded = new Uint8Array(this._frameRef.encode(frame).finish());
+      this._ws!.send(encoded);
+    }
+
+    private sendTextMessage(message: RTVIMessage): void {
+      if (!this._frameRef) {
+        throw new Error("Frame reference not initialized");
+      }
+
+      const textData = message.data as { text: string };
+      const frame = this._frameRef.create({
+        text: {
+          text: textData.text
+        }
+      });
+      const encoded = new Uint8Array(this._frameRef.encode(frame).finish());
+      this._ws!.send(encoded);
     }
   }
   
