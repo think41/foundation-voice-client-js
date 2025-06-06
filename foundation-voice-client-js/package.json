@@ -1,5 +1,5 @@
 {
-  "name": "@think41/client-js-standalone",
+  "name": "@think41/foundation-voice-client-js",
   "version": "0.1.0",
   "description": "PipeCat Client JS SDK with Transport Layer",
   "main": "dist/index.js",
@@ -7,11 +7,11 @@
   "type": "module",
   "publishConfig": {
     "@think41:registry": "https://npm.pkg.github.com",
-    "access": "restricted"
+    "access": "public"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/think41/client-sdk.git"
+    "url": "git+https://github.com/think41/foundation-voice-client-js.git"
   },
   "scripts": {
     "build": "tsup index.ts --format esm --dts",
