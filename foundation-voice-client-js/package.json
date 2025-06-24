@@ -1,6 +1,6 @@
 {
   "name": "@think41/foundation-voice-client-js",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "PipeCat Client JS SDK with Transport Layer",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
