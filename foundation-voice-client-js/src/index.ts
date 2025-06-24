@@ -6,7 +6,6 @@ export { RTVIEvent } from '@pipecat-ai/client-js';
 export * from './utils/utils';
 export {
   TransportManager,
-  WebsocketTransport,
   DailyTransport,
   SmallWebRTCTransport,
   GeminiLiveWebsocketTransport,
@@ -96,3 +95,6 @@ export {
   MessageDispatcher,
   httpActionGenerator
 } from '@pipecat-ai/client-js';
+
+export { WebSocketTransport, ProtobufFrameSerializer } from "@pipecat-ai/websocket-transport";
+

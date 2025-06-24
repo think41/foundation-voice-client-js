@@ -1,6 +1,7 @@
 import { 
   RTVIClientOptions
 } from "@pipecat-ai/client-js";
+import { ProtobufFrameSerializer } from "@pipecat-ai/websocket-transport";
 import { Client } from "../client";
 import { 
   TransportFactory
@@ -19,7 +20,10 @@ export async function createRTVIClient(
   let transport;
   switch (transportType) {
     case "websocket":
-      transport = TransportFactory.create("websocket", "ws://localhost:8000/ws");
+      transport = TransportFactory.create("websocket", {
+        serializer: new ProtobufFrameSerializer(),
+        recorderSampleRate: 16000,
+      });
       break;
     case "webrtc":
       transport = TransportFactory.create("webrtc", {
@@ -31,6 +35,16 @@ export async function createRTVIClient(
       break;
     case "daily":
       transport = TransportFactory.create("daily", {});
+      break;
+    case "gemini":
+      transport = TransportFactory.create("gemini", {
+        api_key: process.env.GEMINI_API_KEY || "",
+      } as any);
+      break;
+    case "openai":
+      transport = TransportFactory.create("openai", {
+        api_key: process.env.OPENAI_API_KEY || "",
+      } as any);
       break;
     default:
       throw new Error(`Invalid transport type: ${transportType}`);
