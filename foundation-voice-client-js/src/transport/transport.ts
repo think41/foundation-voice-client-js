@@ -5,7 +5,10 @@ import {
     RTVIClientOptions,
     Tracks,
 } from "@pipecat-ai/client-js";
-import { WebSocketTransport } from "@pipecat-ai/websocket-transport";
+import {
+    WebSocketTransport,
+    ProtobufFrameSerializer,
+} from '@pipecat-ai/websocket-transport';
 import { DailyTransport } from "@pipecat-ai/daily-transport";
 import { SmallWebRTCTransport } from "@pipecat-ai/small-webrtc-transport";
 import { GeminiLiveWebsocketTransport, GeminiLLMServiceOptions } from '@pipecat-ai/gemini-live-websocket-transport';
@@ -45,7 +48,10 @@ export class TransportFactory {
 
         switch (transportType) {
             case "websocket":
-                return new WebSocketTransport(options as TransportConfig["websocket"]) as unknown as Transport;
+                return new WebSocketTransport({
+                    serializer: new ProtobufFrameSerializer(),
+                    recorderSampleRate: 16000,
+                  });
 
             case "daily":
                 return new DailyTransport(options) as unknown as Transport;
